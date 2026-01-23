@@ -19,3 +19,6 @@ test.ts
 TestData
 wa-logs*
 coverage
+contacts_db.json
+dashboard/node_modules
+dist
