@@ -21,6 +21,7 @@
     "engine-requirements.js"
   ],
   "scripts": {
+    "dev": "concurrently \"npx tsx watch dashboard-server.ts\" \"npm run dev --prefix dashboard\"",
     "build:all": "npm run build && npm run build:docs",
     "build:docs": "typedoc",
     "build": "tsc -P tsconfig.build.json && tsc-esm-fix --tsconfig=tsconfig.build.json --ext=.js",
@@ -67,6 +68,7 @@
     "@typescript-eslint/eslint-plugin": "^8",
     "@typescript-eslint/parser": "^8",
     "@whiskeysockets/eslint-config": "^1.0.0",
+    "concurrently": "^9.2.1",
     "conventional-changelog": "^7.1.1",
     "conventional-changelog-angular": "^8.0.0",
     "esbuild-register": "^3.6.0",
