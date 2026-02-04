@@ -13,76 +13,41 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom'
 import pino from 'pino'
 import fs from 'fs'
+import path from 'path'
 // @ts-ignore
 import QRCode from 'qrcode'
 import { FlowAssistant } from './src/flow-assistant/FlowAssistant'
+import * as addon from './src/addon'
 
-const PROFILES_FILE = './profiles_db.json'
 
-function loadProfiles() {
-    if (fs.existsSync(PROFILES_FILE)) {
-        try {
-            return JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf-8'))
-        } catch (e) {
-            return []
-        }
-    }
-    return [{ id: 'default', name: 'Default Profile', unreadCount: 0 }]
-}
+import { store } from './src/store'
+import { resolvePath, DATA_DIR } from './src/config'
+import { supabase } from './src/supabase'
 
-function saveProfiles(profiles: any[]) {
-    fs.writeFileSync(PROFILES_FILE, JSON.stringify(profiles, null, 2))
-}
+const PROFILES_FILE = resolvePath('profiles_db.json')
 
-function loadContacts(profileId: string) {
-    const file = `./contacts_${profileId}.json`
-    if (fs.existsSync(file)) {
-        try {
-            return JSON.parse(fs.readFileSync(file, 'utf-8'))
-        } catch (e) {
-            return {}
-        }
-    }
-    return {}
-}
+// Helper functions replaced by store methods
 
-function saveContacts(profileId: string, contacts: any) {
-    fs.writeFileSync(`./contacts_${profileId}.json`, JSON.stringify(contacts, null, 2))
-}
-
-function loadMessages(profileId: string) {
-    const file = `./messages_${profileId}.json`
-    if (fs.existsSync(file)) {
-        try {
-            return JSON.parse(fs.readFileSync(file, 'utf-8'))
-        } catch (e) {
-            return []
-        }
-    }
-    return []
-}
-
-function saveMessage(profileId: string, message: any) {
-    const messages = loadMessages(profileId)
-    messages.push(message)
-    if (messages.length > 1000) messages.shift()
-    fs.writeFileSync(`./messages_${profileId}.json`, JSON.stringify(messages, null, 2))
-}
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-const FLOWS_FILE = './flows_db.json'
+const FLOWS_FILE = resolvePath('flows_db.json')
 const httpServer = createServer(app)
 const io = new Server(httpServer, {
     cors: { origin: '*' }
 })
 
+app.get('/', (req: any, res: any) => {
+    res.send('Dashboard Server Running')
+})
+
+
 app.get('/api/flows', (req: any, res: any) => {
     const profileId = req.query.profileId || 'default'
-    const flowFile = `./flows_${profileId}.json`
-    const legacyFile = './flows_db.json'
+    const flowFile = resolvePath(`flows_${profileId}.json`)
+    const legacyFile = resolvePath('flows_db.json')
 
     if (fs.existsSync(flowFile)) {
         res.json(JSON.parse(fs.readFileSync(flowFile, 'utf-8')))
@@ -98,15 +63,16 @@ app.get('/api/flows', (req: any, res: any) => {
 
 app.post('/api/flows', (req: any, res: any) => {
     const profileId = req.query.profileId || 'default'
-    const flowFile = `./flows_${profileId}.json`
+    const flowFile = resolvePath(`flows_${profileId}.json`)
     fs.writeFileSync(flowFile, JSON.stringify(req.body, null, 2))
     res.json({ success: true })
 })
 
 // ============================================
 // API KEY AUTHENTICATION MIDDLEWARE
+// API KEY AUTHENTICATION MIDDLEWARE
 // ============================================
-const API_KEYS_FILE = './api_keys.json'
+const API_KEYS_FILE = resolvePath('api_keys.json')
 
 function loadApiKeys() {
     if (fs.existsSync(API_KEYS_FILE)) {
@@ -149,10 +115,14 @@ const verifyApiKey = (req: any, res: any, next: any) => {
     next()
 }
 
+
+
+
 // ============================================
 // WEBHOOK CONFIGURATION
+// WEBHOOK CONFIGURATION
 // ============================================
-const WEBHOOKS_FILE = './webhooks.json'
+const WEBHOOKS_FILE = resolvePath('webhooks.json')
 
 function loadWebhooks() {
     if (fs.existsSync(WEBHOOKS_FILE)) {
@@ -385,8 +355,10 @@ app.get('/api/admin/api-keys', (req: any, res: any) => {
     res.json({ success: true, data: apiKeys })
 })
 
-let profilesList = loadProfiles()
+// let profilesList = store.getProfiles(PROFILES_FILE) -- REMOVED FOR SAAS
 const sessions = new Map<string, any>()
+app.use('/addon', addon.createAddonRouter(sessions, verifyApiKey))
+
 const connectionStatuses = new Map<string, string>()
 const qrCodes = new Map<string, string>()
 const pairingCodes = new Map<string, string>()
@@ -394,11 +366,16 @@ const FLOW_ASSISTANTS = new Map<string, FlowAssistant>()
 const connectionTimeouts = new Map<string, NodeJS.Timeout>()
 const logger = pino({ level: 'info' })
 
-async function startWhatsApp(profileId: string = 'default') {
+async function startWhatsApp(profileId: string = 'default', providedUserId?: string) {
+    if (!profileId || profileId === 'null') return
     if (sessions.has(profileId) && sessions.get(profileId).sock) return
 
+    console.log(`[${profileId}] Initializing WhatsApp session...`)
+
     // Ensure auth directory exists for this profile
-    const authDir = `baileys_auth_info_${profileId}`
+    const authDir = resolvePath(`baileys_auth_info_${profileId}`)
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true })
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir)
     const { version } = await fetchLatestBaileysVersion()
 
@@ -421,33 +398,41 @@ async function startWhatsApp(profileId: string = 'default') {
     sessions.set(profileId, { sock, profileId })
     connectionStatuses.set(profileId, 'connecting')
 
+    // Find owner once and keep in memory for faster emits
+    let ownerId: string | null = providedUserId || null
+    if (!ownerId) {
+        const { data: profile } = await supabase.from('profiles').select('user_id').eq('id', profileId).single()
+        if (profile) ownerId = profile.user_id
+    }
+    console.log(`[${profileId}] Session initialized. Owner ID: ${ownerId || 'UNKNOWN'}`)
+
     const flowAssistant = new FlowAssistant(sock, profileId)
     FLOW_ASSISTANTS.set(profileId, flowAssistant)
 
     sock.ev.process(async (events) => {
+        addon.handleEvents(profileId, events)
         if (events['connection.update']) {
             const update = events['connection.update']
             const { connection, lastDisconnect, qr } = update
 
             if (qr) {
+                console.log(`[${profileId}] QR Code received, emitting to ${ownerId}`)
                 const qrDataURL = await QRCode.toDataURL(qr)
                 qrCodes.set(profileId, qrDataURL)
-                io.emit('qr.update', { profileId, qr: qrDataURL })
+                if (ownerId) io.to(ownerId).emit('qr.update', { profileId, qr: qrDataURL })
             }
 
-
-            // Emit pairing code if available
             if ((update as any).pairingCode) {
                 const code = (update as any).pairingCode
+                console.log(`[${profileId}] Pairing code generated: ${code}`)
                 pairingCodes.set(profileId, code)
-                console.log(`[${profileId}] Pairing code: ${code}`)
-                io.emit('pairing.code', { profileId, code })
+                if (ownerId) io.to(ownerId).emit('pairing.code', { profileId, code })
             }
 
             if (connection) {
                 connectionStatuses.set(profileId, connection)
-                console.log(`[${profileId}] Connection status: ${connection}`)
-                io.emit('connection.update', { profileId, connection })
+                console.log(`[${profileId}] Connection status: ${connection} (Room: ${ownerId})`)
+                if (ownerId) io.to(ownerId).emit('connection.update', { profileId, connection })
                 sendWebhook(profileId, 'status', { status: connection })
 
                 if (connection === 'open') {
@@ -461,7 +446,7 @@ async function startWhatsApp(profileId: string = 'default') {
                     if (connectionTimeouts.has(profileId)) clearTimeout(connectionTimeouts.get(profileId))
                     const timeout = setTimeout(() => {
                         console.log(`[${profileId}] Connection timed out. Resetting...`)
-                        const authDir = `baileys_auth_info_${profileId}`
+                        const authDir = resolvePath(`baileys_auth_info_${profileId}`)
                         if (fs.existsSync(authDir)) {
                             fs.rmSync(authDir, { recursive: true, force: true })
                         }
@@ -502,11 +487,11 @@ async function startWhatsApp(profileId: string = 'default') {
         }
 
         if (events['contacts.update']) {
-            const contacts = loadContacts(profileId)
+            const contacts = store.getContacts(profileId)
             events['contacts.update'].forEach(c => {
                 if (c.id) contacts[c.id] = c.name || c.notify || contacts[c.id]
             })
-            saveContacts(profileId, contacts)
+            store.saveContacts(profileId, contacts)
             io.emit('contacts.update', { profileId, contacts: events['contacts.update'] })
         }
 
@@ -516,23 +501,26 @@ async function startWhatsApp(profileId: string = 'default') {
                 const jid = msg.key.remoteJid
                 if (!jid) return
 
-                saveMessage(profileId, msg)
+                store.addMessage(profileId, msg)
 
                 // Unread notification logic
                 if (!msg.key.fromMe) {
-                    const profile = profilesList.find((p: any) => p.id === profileId)
+                    const { data: profile } = await supabase.from('profiles').select('*').eq('id', profileId).single()
                     if (profile) {
-                        profile.unreadCount = (profile.unreadCount || 0) + 1
-                        saveProfiles(profilesList)
-                        io.emit('profiles.update', profilesList)
+                        const newCount = (profile.unreadCount || 0) + 1
+                        await supabase.from('profiles').update({ unreadCount: newCount }).eq('id', profileId)
+                        // Refresh user's profiles
+                        const { data: userProfiles } = await supabase.from('profiles').select('*').eq('user_id', profile.user_id)
+                        io.to(profile.user_id).emit('profiles.update', userProfiles)
                     }
                 }
 
-                const contacts = loadContacts(profileId)
+                const contacts = store.getContacts(profileId)
                 if (msg.pushName && !contacts[jid]) {
                     contacts[jid] = msg.pushName
-                    saveContacts(profileId, contacts)
-                    io.emit('contacts.update', { profileId, contacts: [{ id: jid, name: msg.pushName }] })
+                    store.saveContacts(profileId, contacts)
+                    const { data: profile } = await supabase.from('profiles').select('user_id').eq('id', profileId).single()
+                    if (profile) io.to(profile.user_id).emit('contacts.update', { profileId, contacts: [{ id: jid, name: msg.pushName }] })
                 }
 
                 if (!msg.key.fromMe) {
@@ -546,24 +534,57 @@ async function startWhatsApp(profileId: string = 'default') {
                 }
 
                 const assistant = FLOW_ASSISTANTS.get(profileId)
-                if (!msg.key.fromMe && assistant) {
+                // Only process if it's not from me, assistant exists, and NOT a group message
+                if (!msg.key.fromMe && assistant && !jid.endsWith('@g.us')) {
                     const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
                     if (text) await assistant.handleMessage(jid, text)
                 }
             })
-            io.emit('messages.upsert', { profileId, ...upsert })
+            const { data: profile } = await supabase.from('profiles').select('user_id').eq('id', profileId).single()
+            if (profile) io.to(profile.user_id).emit('messages.upsert', { profileId, ...upsert })
         }
     })
     return sock
 }
 
+// Auth Middleware for Socket.io
+io.use(async (socket, next) => {
+    try {
+        const token = (socket.handshake.auth as any).token
+        if (!token) return next(new Error('Authentication error: Token missing'))
+
+        const { data: { user }, error } = await supabase.auth.getUser(token)
+        if (error || !user) return next(new Error('Authentication error: Invalid session'))
+
+        socket.data.user = user
+        next()
+    } catch (e) {
+        next(new Error('Internal auth error'))
+    }
+})
+
 io.on('connection', async (socket) => {
-    console.log('Client connected')
+    const userId = socket.data.user.id
+    console.log(`User connected: ${socket.data.user.email} (${userId})`)
 
-    socket.emit('profiles.update', profilesList)
+    // Join user-specific room for private emits
+    socket.join(userId)
 
-    socket.on('switchProfile', (profileId) => {
-        const contacts = loadContacts(profileId)
+    // Send initial profiles for this user
+    const { data: userProfiles, error: fetchError } = await supabase.from('profiles').select('*').eq('user_id', userId).order('created_at', { ascending: true })
+    if (fetchError) console.error(`[${userId}] Profile fetch error:`, fetchError.message)
+    socket.emit('profiles.update', userProfiles || [])
+
+    socket.on('switchProfile', async (profileId) => {
+        if (!profileId) return
+
+        // Auto-boot session if it died or server restarted
+        if (!sessions.has(profileId)) {
+            console.log(`[${userId}] Profile ${profileId} not running. Starting WhatsApp...`)
+            startWhatsApp(profileId, userId)
+        }
+
+        const contacts = store.getContacts(profileId)
         socket.emit('connection.update', { profileId, connection: connectionStatuses.get(profileId) || 'close' })
         if (qrCodes.has(profileId)) {
             socket.emit('qr.update', { profileId, qr: qrCodes.get(profileId) })
@@ -572,39 +593,57 @@ io.on('connection', async (socket) => {
             socket.emit('pairing.code', { profileId, code: pairingCodes.get(profileId) })
         }
         socket.emit('contacts.update', { profileId, contacts: Object.entries(contacts).map(([id, name]) => ({ id, name })) })
-        socket.emit('messages.history', { profileId, messages: loadMessages(profileId) })
+        socket.emit('messages.history', { profileId, messages: store.getMessages(profileId) })
 
         // Reset unread for this profile when switched to
-        const profile = profilesList.find((p: any) => p.id === profileId)
-        if (profile) {
-            profile.unreadCount = 0
-            saveProfiles(profilesList)
-            io.emit('profiles.update', profilesList)
-        }
+        await supabase.from('profiles').update({ unreadCount: 0 }).eq('id', profileId).eq('user_id', userId)
+        const { data: refreshed } = await supabase.from('profiles').select('*').eq('user_id', userId).order('created_at', { ascending: true })
+        io.to(userId).emit('profiles.update', refreshed || [])
     })
 
-    socket.on('addProfile', (name) => {
+    socket.on('addProfile', async (name) => {
+        if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+            socket.emit('profile.error', { message: 'CRITICAL: SUPABASE_SERVICE_ROLE_KEY is missing in .env! Backend cannot save bot data.' })
+            return
+        }
         const id = `profile-${Date.now()}`
-        profilesList.push({ id, name, unreadCount: 0 })
-        saveProfiles(profilesList)
-        io.emit('profiles.update', profilesList)
-        startWhatsApp(id)
-        socket.emit('profile.added', id) // Tell the specific client the new ID
+        console.log(`[${userId}] Creating new profile: ${name} (${id})`)
+
+        const { data: newProfile, error } = await supabase.from('profiles').insert({
+            id,
+            user_id: userId,
+            name,
+            unreadCount: 0
+        }).select().single()
+
+        if (error) {
+            console.error('Add profile database error:', error)
+            socket.emit('profile.error', { message: 'Failed to save profile to database. Check SQL setup.' })
+            return
+        }
+
+        console.log(`[${userId}] Profile saved to DB, refreshing list...`)
+        const { data: refreshed } = await supabase.from('profiles').select('*').eq('user_id', userId).order('created_at', { ascending: true })
+        io.to(userId).emit('profiles.update', refreshed)
+
+        console.log(`[${userId}] Starting WhatsApp session for ${id}`)
+        startWhatsApp(id, userId)
+        socket.emit('profile.added', id)
     })
 
-    socket.on('updateProfileName', ({ profileId, name }) => {
-        const profile = profilesList.find((p: any) => p.id === profileId)
-        if (profile) {
-            profile.name = name
-            saveProfiles(profilesList)
-            io.emit('profiles.update', profilesList)
-        }
+    socket.on('updateProfileName', async ({ profileId, name }) => {
+        await supabase.from('profiles').update({ name }).eq('id', profileId).eq('user_id', userId)
+        const { data: refreshed } = await supabase.from('profiles').select('*').eq('user_id', userId).order('created_at', { ascending: true })
+        io.to(userId).emit('profiles.update', refreshed)
     })
 
     socket.on('deleteProfile', async (profileId: string) => {
-        // 1. Revert from profiles list
-        profilesList = profilesList.filter((p: any) => p.id !== profileId)
-        saveProfiles(profilesList)
+        // Security check: ensure user owns profile
+        const { data: check } = await supabase.from('profiles').select('id').eq('id', profileId).eq('user_id', userId).single()
+        if (!check) return
+
+        // 1. Delete from Supabase
+        await supabase.from('profiles').delete().eq('id', profileId)
 
         // 2. Terminate session
         const session = sessions.get(profileId)
@@ -614,14 +653,14 @@ io.on('connection', async (socket) => {
         }
 
         // 3. Clean up files
-        const authDir = `baileys_auth_info_${profileId}`
+        const authDir = resolvePath(`baileys_auth_info_${profileId}`)
         if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true })
-        if (fs.existsSync(`./contacts_${profileId}.json`)) fs.unlinkSync(`./contacts_${profileId}.json`)
-        if (fs.existsSync(`./messages_${profileId}.json`)) fs.unlinkSync(`./messages_${profileId}.json`)
-        if (fs.existsSync(`./flows_${profileId}.json`)) fs.unlinkSync(`./flows_${profileId}.json`)
-        if (fs.existsSync(`./sessions_${profileId}.json`)) fs.unlinkSync(`./sessions_${profileId}.json`)
+        store.deleteProfileData(profileId)
+        if (fs.existsSync(resolvePath(`flows_${profileId}.json`))) fs.unlinkSync(resolvePath(`flows_${profileId}.json`))
+        if (fs.existsSync(resolvePath(`sessions_${profileId}.json`))) fs.unlinkSync(resolvePath(`sessions_${profileId}.json`))
 
-        io.emit('profiles.update', profilesList)
+        const { data: refreshed } = await supabase.from('profiles').select('*').eq('user_id', userId).order('created_at', { ascending: true })
+        io.to(userId).emit('profiles.update', refreshed || [])
     })
 
     socket.on('logout', async (profileId) => {
@@ -630,7 +669,7 @@ io.on('connection', async (socket) => {
             try { await session.sock.logout() } catch (e) { }
             sessions.delete(profileId)
             connectionStatuses.set(profileId, 'close')
-            io.emit('connection.update', { profileId, connection: 'close' })
+            io.to(userId).emit('connection.update', { profileId, connection: 'close' })
         }
     })
 
@@ -640,7 +679,7 @@ io.on('connection', async (socket) => {
             try { session.sock.end(new Error('Manual refresh')) } catch (e) { }
             sessions.delete(profileId)
         }
-        const authDir = `baileys_auth_info_${profileId}`
+        const authDir = resolvePath(`baileys_auth_info_${profileId}`)
         if (fs.existsSync(authDir)) {
             fs.rmSync(authDir, { recursive: true, force: true })
         }
@@ -659,7 +698,7 @@ io.on('connection', async (socket) => {
                 const code = await session.sock.requestPairingCode(cleanNumber)
                 pairingCodes.set(profileId, code)
                 console.log(`[${profileId}] Pairing code generated: ${code}`)
-                io.emit('pairing.code', { profileId, code })
+                io.to(userId).emit('pairing.code', { profileId, code })
             } catch (error) {
                 console.error(`[${profileId}] Failed to request pairing code:`, error)
                 socket.emit('pairing.error', { profileId, error: 'Failed to generate pairing code' })
@@ -691,12 +730,92 @@ io.on('connection', async (socket) => {
             }
         }
     })
+
+    // ============================================
+    // SUPER ADMIN HANDLERS
+    // ============================================
+
+    socket.on('admin.getStats', async () => {
+        // Verify role in user_roles table
+        const { data: userRole } = await supabase.from('user_roles').select('role').eq('user_id', userId).single()
+        if (userRole?.role !== 'admin') {
+            console.warn(`Unauthorized admin access attempt by ${socket.data.user.email}`)
+            return
+        }
+
+        // Fetch all profiles
+        const { data: allProfiles } = await supabase.from('profiles').select('*').order('created_at', { ascending: false })
+
+        const enriched = (allProfiles || []).map(p => ({
+            ...p,
+            status: connectionStatuses.get(p.id) || 'close',
+            // In a real prod setup, you'd store email in a public profiles/user_meta table
+            user_email: 'User ' + p.user_id.substring(0, 8)
+        }))
+
+        socket.emit('admin.statsUpdate', enriched)
+    })
+
+    socket.on('admin.profileAction', async ({ type, profileId }) => {
+        const { data: userRole } = await supabase.from('user_roles').select('role').eq('user_id', userId).single()
+        if (userRole?.role !== 'admin') return
+
+        if (type === 'logout') {
+            const session = sessions.get(profileId)
+            if (session?.sock) {
+                try { await session.sock.logout() } catch (e) { }
+                sessions.delete(profileId)
+                connectionStatuses.set(profileId, 'close')
+            }
+        } else if (type === 'delete') {
+            // Security: Delete from DB
+            await supabase.from('profiles').delete().eq('id', profileId)
+
+            // Terminate session
+            const session = sessions.get(profileId)
+            if (session?.sock) {
+                try { session.sock.end(undefined) } catch (e) { }
+                sessions.delete(profileId)
+            }
+
+            // Cleanup files
+            const authDir = resolvePath(`baileys_auth_info_${profileId}`)
+            if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true })
+            store.deleteProfileData(profileId)
+            if (fs.existsSync(resolvePath(`flows_${profileId}.json`))) fs.unlinkSync(resolvePath(`flows_${profileId}.json`))
+            if (fs.existsSync(resolvePath(`sessions_${profileId}.json`))) fs.unlinkSync(resolvePath(`sessions_${profileId}.json`))
+        }
+
+        // Refresh admin stats for all admins
+        // We'll just refresh for the current socket for simplicity
+        socket.emit('admin.getStats')
+    })
 })
 
-const PORT = 3001
-httpServer.listen(PORT, () => {
-    console.log(`Dashboard Server listening on port ${PORT}`)
-    profilesList.forEach((p: any) => {
-        startWhatsApp(p.id)
+// Serve Frontend (Deployment Support)
+const frontendPath = path.join(process.cwd(), 'dashboard/dist')
+if (fs.existsSync(frontendPath)) {
+    console.log('Serving frontend from:', frontendPath)
+    app.use(express.static(frontendPath))
+    app.get('*', (req: any, res: any) => {
+        // Skip API/Socket paths to avoid HTML response on 404s
+        if (req.path.startsWith('/api') || req.path.startsWith('/addon') || req.path.startsWith('/socket.io')) {
+            return res.status(404).json({ error: 'Not Found' })
+        }
+        res.sendFile(path.join(frontendPath, 'index.html'))
     })
+}
+
+const PORT = 3001
+httpServer.listen(PORT, async () => {
+    console.log(`Dashboard Server listening on port ${PORT}`)
+
+    // Start only active profiles if you have a service key, 
+    // otherwise they start when a user logs in.
+    // For SaaS, we usually want to boot all sessions if possible.
+    const { data: allProfiles } = await supabase.from('profiles').select('id, user_id')
+    if (allProfiles) {
+        console.log(`Booting ${allProfiles.length} WhatsApp sessions...`)
+        allProfiles.forEach(p => startWhatsApp(p.id, p.user_id))
+    }
 })

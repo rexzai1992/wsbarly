@@ -22,3 +22,6 @@ coverage
 contacts_db.json
 dashboard/node_modules
 dist
+
+# Centralized Data
+data/
